@@ -21,12 +21,9 @@ parse cleanly under Python 3.12.
 
 ## Known gaps
 
-These three are TRUNCATED — recovered from a partial Read or from an Edit
+All 18 Python modules parse cleanly under Python 3.12. Earlier truncation in planner.py and two tests was an artifact of my picking a later PARTIAL Read over the complete snapshot; fixed by preferring the newest version that parses.
 fragment, not a full-file snapshot. Copies are kept in `_PARTIAL/`.
 
-  - planner.py                        unterminated docstring at line 129
-  - tests/test_agent_orchestration.py starts mid-file
-  - tests/test_agent_runner.py        starts mid-file
 
 Mentioned in transcripts but not recovered:
 

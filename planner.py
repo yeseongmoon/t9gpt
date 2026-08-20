@@ -1,3 +1,42 @@
+"""Provider-neutral, structured attack-reproduction planning."""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+from abc import ABC, abstractmethod
+from pathlib import Path
+from typing import Any
+
+from pydantic import ValidationError
+
+from models import AttackPlan, Scenario
+
+SYSTEM_PROMPT = """\
+You are the planning component of T9-GPT, an authorized attack-traffic dataset
+generator operating only against the disposable Vulhub target described below.
+
+Your job is NOT to perform a penetration test. Produce the smallest reproducible
+procedure that demonstrates only the named vulnerability.
+
+Mandatory constraints:
+- Do not scan ports, enumerate directories, brute-force, test unrelated CVEs, or
+  perform post-exploitation, persistence, privilege escalation, credential
+  collection, lateral movement, denial of service, or destructive actions.
+- Use only ${TARGET_HOST}, ${TARGET_PORT}, and optional ${PROOF_TOKEN}
+  placeholders for runtime-specific values. Never invent other targets.
+- Prove execution harmlessly with identity/version output or the unique
+  ${PROOF_TOKEN}. Temporary marker files must be under /tmp.
+- Commands run as an unprivileged user in a disposable Python container with
+  generated files mounted at /work and a writable /tmp.
+- Prefer a Python standard-library script when a request needs multipart,
+  encoding, or multiple HTTP operations. Do not install packages.
+- argv is executed directly without a shell. If a generated script is needed,
+  put it in files and invoke it as ["python", "/work/<name>.py", ...].
+- Stop immediately after obtaining evidence required by the verifier.
+- Every expected_evidence field must state the specific harmless proof expected.
 """
 
 
@@ -127,3 +166,96 @@ def build_planner(scenario: Scenario) -> PlannerBackend:
     if scenario.planner.provider == "openai":
         return OpenAIPlannerBackend(scenario)
     raise PlannerError(f"unsupported planner provider: {scenario.planner.provider}")
+
+
+def build_planning_prompt(
+    scenario: Scenario,
+    proof_token: str,
+    vulhub_readme: str,
+    observations: list[dict[str, object]],
+) -> str:
+    environment = scenario.environment
+    if environment is None:
+        raise PlannerError("scenario has no environment")
+    verifier = [rule.model_dump(mode="json") for rule in scenario.verification]
+    history = json.dumps(observations, indent=2) if observations else "No prior attempts."
+    return f"""\
+SCENARIO
+- T9 code: {scenario.t9_code}
+- Name: {scenario.name}
+- CVE/advisory: {scenario.cve or "not assigned"}
+- Software: {scenario.software}
+- Vulhub path: {environment.path}
+- Target port: {environment.target_port}
+- Required proof token: {proof_token}
+- Maximum steps: {scenario.planner.max_steps}
+
+MACHINE VERIFIER
+{json.dumps(verifier, indent=2)}
+
+LOCAL VULHUB DOCUMENTATION
+{_bounded(vulhub_readme, 30_000)}
+
+PRIOR ATTEMPT OBSERVATIONS
+{_bounded(history, scenario.planner.max_output_chars)}
+
+Return a minimal AttackPlan. It must contain no more than
+{scenario.planner.max_steps} steps and must make the machine verifier pass.
+"""
+
+
+def read_vulhub_documentation(vulhub_dir: Path) -> str:
+    for name in ("README.md", "README.zh-cn.md"):
+        path = vulhub_dir / name
+        if path.is_file():
+            return path.read_text(encoding="utf-8", errors="replace")
+    return "No local Vulhub README was found."
+
+
+def validate_plan_policy(plan: AttackPlan, scenario: Scenario) -> None:
+    if len(plan.steps) > scenario.planner.max_steps:
+        raise PlannerError(
+            f"plan has {len(plan.steps)} steps; limit is {scenario.planner.max_steps}"
+        )
+    banned = {
+        "nmap",
+        "masscan",
+        "rustscan",
+        "gobuster",
+        "ffuf",
+        "dirb",
+        "hydra",
+        "sqlmap",
+        "metasploit",
+        "msfconsole",
+    }
+    for step in plan.steps:
+        executable = Path(step.argv[0]).name.lower()
+        if executable in banned:
+            raise PlannerError(f"out-of-scope executable in step {step.id}: {executable}")
+        joined = "\n".join(step.argv)
+        if "${TARGET_HOST}" not in joined and "${TARGET_PORT}" not in joined:
+            raise PlannerError(f"step {step.id} does not reference the declared target")
+        if "http://" in joined or "https://" in joined:
+            # Literal public research URLs belong in planning, never execution.
+            literals = [
+                value
+                for value in step.argv
+                if ("http://" in value or "https://" in value)
+                and "${TARGET_HOST}" not in value
+            ]
+            if literals:
+                raise PlannerError(f"step {step.id} contains a literal URL")
+
+
+def _extract_json(text: str) -> object:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = stripped.split("\n", 1)[1].rsplit("```", 1)[0]
+    return json.loads(stripped)
+
+
+def _bounded(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n...[truncated by T9-GPT]"
